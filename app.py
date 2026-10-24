@@ -1,0 +1,306 @@
+import os
+from typing import Optional
+
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
+
+from pdf_tools import (
+    ingest_pdf_to_vector_db,
+    search_manuals,
+    list_ingested_manuals,
+    MANUAL_DIR,
+    MANUAL_REGISTRY,
+    IMAGE_HOLDER_DIR,
+)
+from gemma_router import route_query, answer_query
+from agents.orchestrator import run_agent_pipeline
+from memory import conversation_memory
+
+app = FastAPI(title="Aircraft Maintenance API", version="1.0")
+
+# Mount image static files directory
+os.makedirs(IMAGE_HOLDER_DIR, exist_ok=True)
+app.mount("/images", StaticFiles(directory=IMAGE_HOLDER_DIR), name="images")
+
+# Allow the frontend (any origin during dev — tighten this for production)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+@app.on_event("startup")
+def warmup_services():
+    import threading
+
+    def _warm():
+        try:
+            print("[LOG] Background warmup: loading embeddings and manual routing cache...", flush=True)
+            from gemma_router import _get_description_embeddings
+            _get_description_embeddings()
+            print("[LOG] Background warmup finished: query routing is now instant!", flush=True)
+        except Exception as ex:
+            print(f"[WARN] Background warmup non-fatal error: {ex}", flush=True)
+
+    threading.Thread(target=_warm, daemon=True).start()
+
+
+# ---------------------------------------------------------------------------
+# Request / response models
+# ---------------------------------------------------------------------------
+class AskRequest(BaseModel):
+    query: str
+    session_id: str = "default"
+    use_agents: bool = False
+    sensor_data: Optional[dict] = None
+    aircraft_info: Optional[dict] = None
+
+
+class QAItem(BaseModel):
+    query: str
+    answer: str
+
+
+class QAHistoryResponse(BaseModel):
+    session_id: str
+    turn_count: int
+    history: list[QAItem]
+
+
+class IngestRequest(BaseModel):
+    manual_key: str
+
+
+DEFAULT_SENSOR_DATA = {
+    "engine_temp": "simulated: 640°C (rising)",
+    "oil_pressure": "simulated: 42 psi (below nominal)",
+    "vibration": "simulated: 2.8 IPS (elevated)",
+    "fault_codes": "simulated: none reported",
+    "maintenance_history": "simulated: last inspected 120 flight hours ago",
+    "operating_hours": "simulated: 8,400",
+    "flight_cycles": "simulated: 3,150",
+}
+
+DEFAULT_AIRCRAFT_INFO = {
+    "aircraft_model": "Boeing 737-800",
+    "engine_model": "CFM56-7B",
+}
+
+
+# ---------------------------------------------------------------------------
+# Core ask logic (used by the /ask endpoint)
+# ---------------------------------------------------------------------------
+def ask(
+    query: str,
+    session_id: str = "default",
+    use_agents: bool = False,
+    sensor_data: dict = None,
+    aircraft_info: dict = None,
+) -> dict:
+    print(f"\n[LOG] ask() called: session_id='{session_id}', query='{query}', use_agents={use_agents}")
+
+    if use_agents:
+        direct = conversation_memory.try_direct_answer(session_id, query)
+        if direct:
+            print(f"[LOG] [Memory] Answered directly from stored last turn.")
+            return {"mode": "direct_memory_answer", "answer": direct}
+
+        conversation_context = conversation_memory.get_relevant_context(session_id, query)
+
+        sensor_data = sensor_data or DEFAULT_SENSOR_DATA
+        aircraft_info = aircraft_info or DEFAULT_AIRCRAFT_INFO
+
+        report = run_agent_pipeline(query, sensor_data, aircraft_info, conversation_context)
+
+        conversation_memory.add_turn(session_id, query, report, mode="multi_agent")
+
+        return {"mode": "multi_agent", "report": report}
+
+    else:
+        # Simple RAG — now also memory-aware
+        conversation_context = conversation_memory.get_relevant_context(session_id, query)
+
+        manual_key = route_query(query)
+        raw_results = search_manuals.invoke({"query": query, "manual_key": manual_key})
+        final_answer = answer_query(query, raw_results, conversation_context)
+
+        conversation_memory.add_turn(
+            session_id,
+            query,
+            {"manual_key": manual_key, "answer": final_answer, "context": raw_results},
+            mode="simple_rag",
+        )
+
+        return {
+            "mode": "simple_rag",
+            "manual_key": manual_key,
+            "context": raw_results,
+            "answer": final_answer,
+        }
+
+# ---------------------------------------------------------------------------
+# Endpoints
+# ---------------------------------------------------------------------------
+@app.get("/")
+def root():
+    return {"status": "ok", "service": "Aircraft Maintenance API"}
+
+
+@app.post("/ask")
+def ask_endpoint(payload: AskRequest):
+    """
+    Main endpoint the frontend calls. `use_agents` decides the path:
+    true  -> full multi-agent pipeline (with session memory + SQLite persistence)
+    false -> simple RAG answer (no agent memory involved)
+    """
+    try:
+        result = ask(
+            query=payload.query,
+            session_id=payload.session_id,
+            use_agents=payload.use_agents,
+            sensor_data=payload.sensor_data,
+            aircraft_info=payload.aircraft_info,
+        )
+        return result
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        err_msg = str(e)
+        if "disconnected" in err_msg.lower() or "remote protocol" in err_msg.lower():
+            err_msg = "Ollama connection lost while generating response. Please check that Ollama is running and has sufficient RAM/VRAM."
+        print(f"[ERROR] /ask failed: {err_msg}")
+        raise HTTPException(status_code=500, detail=err_msg)
+
+
+
+@app.get("/qa-history/{session_id}")
+def get_qa_history(session_id: str):
+    """
+    Returns a clean list of {query, answer} pairs for this session, in
+    order — no embeddings, no full report JSON. `answer` is the exact text
+    the LLM generated (the RAG answer, or the multi-agent Digital Twin's
+    narrative summary).
+    """
+    try:
+        qa_list = conversation_memory.get_qa_history(session_id)
+        return {"session_id": session_id, "qa_pairs": qa_list}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/history/{session_id}")
+def get_history(session_id: str):
+    """Returns the full stored conversation/report history for a session."""
+    try:
+        history = conversation_memory.get_history(session_id)
+        return {"session_id": session_id, "turns": history}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/history/{session_id}")
+def clear_history(session_id: str):
+    """Clears a session's stored history (e.g. user starts a new chat)."""
+    try:
+        conversation_memory.clear_session(session_id)
+        return {"status": "cleared", "session_id": session_id}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/sessions")
+def get_sessions():
+    """Returns a list of all distinct sessions with their titles, turn counts, and timestamps."""
+    try:
+        sessions = conversation_memory.get_sessions()
+        return {"sessions": sessions}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/manuals")
+def get_manuals():
+    """Lists registered manuals and their ingestion status."""
+    try:
+        ingested = list_ingested_manuals.invoke({})
+        return {
+            "registry": {
+                key: {"file": meta["file"], "description": meta["description"]}
+                for key, meta in MANUAL_REGISTRY.items()
+            },
+            "ingested_status": ingested,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/ingest")
+def ingest_manual(payload: IngestRequest):
+    """Ingests a single manual (by its MANUAL_REGISTRY key) into its Chroma DB."""
+    if payload.manual_key not in MANUAL_REGISTRY:
+        raise HTTPException(status_code=404, detail=f"Unknown manual_key '{payload.manual_key}'")
+    try:
+        result = ingest_pdf_to_vector_db.invoke({
+            "pdf_filename": MANUAL_REGISTRY[payload.manual_key]["file"]
+        })
+        return {"result": result}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/ingest-all")
+def ingest_all():
+    """Ingests every manual currently in MANUAL_REGISTRY."""
+    results = {}
+    for key, meta in MANUAL_REGISTRY.items():
+        try:
+            results[key] = ingest_pdf_to_vector_db.invoke({"pdf_filename": meta["file"]})
+        except Exception as e:
+            results[key] = f"Error: {e}"
+    return {"results": results}
+
+
+@app.post("/upload-manual")
+async def upload_manual(
+    file: UploadFile = File(...),
+    manual_key: str = Form(...),
+    description: str = Form(...),
+    two_column: bool = Form(False),
+):
+    """Uploads a PDF manual, registers it into MANUAL_REGISTRY, and automatically ingests it."""
+    try:
+        os.makedirs(MANUAL_DIR, exist_ok=True)
+        filename = file.filename or f"{manual_key}.pdf"
+        file_path = os.path.join(MANUAL_DIR, filename)
+
+        contents = await file.read()
+        with open(file_path, "wb") as f:
+            f.write(contents)
+
+        MANUAL_REGISTRY[manual_key] = {
+            "file": filename,
+            "description": description,
+            "two_column": two_column,
+        }
+
+        # Ingest the newly uploaded manual
+        ingest_res = ingest_pdf_to_vector_db.invoke({"pdf_filename": filename})
+        return {
+            "status": "success",
+            "manual_key": manual_key,
+            "filename": filename,
+            "ingest_result": ingest_res,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+if __name__ == "__main__":
+    import uvicorn
+    os.makedirs(MANUAL_DIR, exist_ok=True)
+    uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True)
